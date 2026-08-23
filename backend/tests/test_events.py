@@ -1,7 +1,9 @@
 from typing import Optional
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.db.collections import get_event_repository
 from app.main import app
 from app.models.event import Event
@@ -23,7 +25,8 @@ class FakeEventRepository:
         return item
 
 
-def test_create_and_list_event(client: TestClient) -> None:
+def test_create_and_list_event(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "allowed_email_domains", "buck-e.app")
     fake_repo = FakeEventRepository()
     app.dependency_overrides[get_event_repository] = lambda: fake_repo
 
@@ -48,6 +51,51 @@ def test_create_and_list_event(client: TestClient) -> None:
         get_response = client.get(f"/api/v1/events/{created['id']}")
         assert get_response.status_code == 200
         assert get_response.json()["email_subject"] == "Weekly summary"
+    finally:
+        app.dependency_overrides.pop(get_event_repository, None)
+
+
+def test_create_event_rejects_disallowed_sender_domain(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "allowed_email_domains", "buck-e.app")
+    fake_repo = FakeEventRepository()
+    app.dependency_overrides[get_event_repository] = lambda: fake_repo
+
+    try:
+        response = client.post(
+            "/api/v1/events/",
+            json={
+                "sender": "alerts@not-allowed.com",
+                "sent_on": "2026-08-23T20:50:00Z",
+                "email_subject": "Weekly summary",
+                "email_content": "Here is your weekly summary.",
+            },
+        )
+        assert response.status_code == 400
+        assert len(fake_repo.list()) == 0
+    finally:
+        app.dependency_overrides.pop(get_event_repository, None)
+
+
+def test_create_event_rejects_all_senders_when_no_domains_configured(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "allowed_email_domains", "")
+    fake_repo = FakeEventRepository()
+    app.dependency_overrides[get_event_repository] = lambda: fake_repo
+
+    try:
+        response = client.post(
+            "/api/v1/events/",
+            json={
+                "sender": "alerts@buck-e.app",
+                "sent_on": "2026-08-23T20:50:00Z",
+                "email_subject": "Weekly summary",
+                "email_content": "Here is your weekly summary.",
+            },
+        )
+        assert response.status_code == 400
     finally:
         app.dependency_overrides.pop(get_event_repository, None)
 

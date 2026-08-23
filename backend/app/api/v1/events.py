@@ -1,10 +1,18 @@
 from fastapi import APIRouter, Depends, HTTPException
 
+from app.core.config import settings
 from app.db.collections import get_event_repository
 from app.db.repository import FirestoreRepository
 from app.models.event import Event
 
 router = APIRouter(prefix="/events", tags=["events"])
+
+
+def _sender_domain_allowed(sender: str) -> bool:
+    sender_lower = sender.lower()
+    return any(
+        sender_lower.endswith(f"@{domain}") for domain in settings.allowed_email_domains_list
+    )
 
 
 @router.get("/", response_model=list[Event])
@@ -30,4 +38,6 @@ async def create_event(
     payload: Event,
     repo: FirestoreRepository[Event] = Depends(get_event_repository),
 ) -> Event:
+    if not _sender_domain_allowed(payload.sender):
+        raise HTTPException(status_code=400, detail="Sender email domain is not allowed")
     return repo.create(payload)

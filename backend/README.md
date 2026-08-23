@@ -67,6 +67,18 @@ project is required.
 4. Run the backend as usual (`uv run dev`). All Firestore reads/writes go to the emulator; data
    resets when the emulator process stops.
 
+### Email domain allow-list
+
+`POST /api/v1/events/` only accepts events whose `sender` email address ends with one of the
+domains in `allowed_email_domains`, a comma-separated list in `.env`:
+
+```env
+allowed_email_domains=example.com,example.org
+```
+
+If `allowed_email_domains` is unset or empty, every `POST` is rejected with `400` — the list is
+an allow-list, not an optional filter.
+
 ## Tests
 
 ```bash

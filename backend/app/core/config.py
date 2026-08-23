@@ -16,5 +16,12 @@ class Settings(BaseSettings):
     firestore_database_id: str = "(default)"
     firestore_emulator_host: Optional[str] = None
 
+    # Email filtering
+    allowed_email_domains: str = ""
+
+    @property
+    def allowed_email_domains_list(self) -> list[str]:
+        return [d.strip().lower() for d in self.allowed_email_domains.split(",") if d.strip()]
+
 
 settings = Settings()
