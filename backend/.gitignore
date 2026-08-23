@@ -1,0 +1,34 @@
+# virtual environments
+.venv/
+venv/
+env/
+
+# python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# build / packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# env files (can opt-in for committing if needed)
+.env
+.env.*
+
+# misc
+.DS_Store
+*.log

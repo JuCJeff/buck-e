@@ -1,0 +1,24 @@
+[project]
+name = "buck-e-backend"
+version = "0.1.0"
+description = "buck-e backend API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.141.1",
+    "pydantic-settings>=2.15.0",
+    "uvicorn[standard]>=0.52.4",
+]
+
+[project.scripts]
+dev = "app.scripts:dev"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
