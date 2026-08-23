@@ -25,12 +25,47 @@ Server runs at <http://localhost:8000> with auto-reload. Docs at <http://localho
 
 ## Config
 
-Settings live in `app/core/config.py` (via `pydantic-settings`). Override any of `app_name`,
-`app_version`, `debug` by creating a `.env` file in `backend/`, e.g.:
+Settings live in `app/core/config.py` (via `pydantic-settings`). Copy `.env.example` to `.env`
+in `backend/` and fill in the values, e.g.:
 
 ```env
 debug=true
+
+gcp_project_id=your-gcp-project-id
+google_application_credentials=/absolute/path/to/service-account.json
+firestore_database_id=(default)
 ```
+
+`gcp_project_id` and `google_application_credentials` point at an existing GCP/Firebase project
+and service-account key — this project does not set those up for you. If
+`google_application_credentials` is unset, the backend falls back to Application Default
+Credentials (used in deployed environments with an attached service account).
+
+### Firestore emulator (local dev)
+
+To develop against a local Firestore emulator instead of real GCP, no service account or
+project is required.
+
+1. Install the emulator once (needs the JDK, which `gcloud` will check for):
+
+   ```bash
+   gcloud components install cloud-firestore-emulator
+   ```
+
+2. Start it in one terminal:
+
+   ```bash
+   gcloud emulators firestore start --host-port=localhost:8080
+   ```
+
+3. In `backend/.env`, set:
+
+   ```env
+   firestore_emulator_host=localhost:8080
+   ```
+
+4. Run the backend as usual (`uv run dev`). All Firestore reads/writes go to the emulator; data
+   resets when the emulator process stops.
 
 ## Tests
 
