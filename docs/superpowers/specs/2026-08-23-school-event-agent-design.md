@@ -4,6 +4,16 @@
 **Hackathon:** All Things Agentic Hackathon — Collaborative Partner track
 **Deadline:** 2026-08-31 (≈8 days from design time — MVP-first, see cut line)
 
+> **Reconciliation note (2026-08-24):** a teammate independently built a
+> Firestore data layer on `main` (`FirestoreModel`/`FirestoreRepository`,
+> an `Event` model for the raw email, a `ProcessedEvent` model, and
+> `GET`/`POST /api/v1/events` + `/api/v1/processed-events`) before this
+> spec's plan started executing. The **Data model** section below has been
+> updated to build on that foundation instead of the flat `events/{id}`
+> shape originally described here — the product behavior and architecture
+> are unchanged, only the persistence shape. See the implementation plan's
+> reconciliation note for the full task-by-task diff.
+
 ## Problem
 
 A student's inbox gets emails from school addresses announcing real-life events
@@ -50,20 +60,25 @@ Firestore ◀──────────────────────�
   message itself).
 - Calls `users.history.list` since the last known `historyId`, then
   `users.messages.get` for each new message.
-- Filters to messages from the school sender domain (configurable).
+- Filters to messages from an allowed sender domain (configurable,
+  multi-domain).
 - Dedupes by Gmail `messageId` against a `processed_message_ids` Firestore
   collection — required because Pub/Sub retries delivery on any non-2xx
   response, and a naive handler would double-process.
+- Persists the raw message as an `Event` document (via the existing
+  `FirestoreRepository[Event]`) before triage runs, so the source email is
+  never lost even if triage fails.
 
 **Triage + Summarizer agent** (ADK + Gemini, single LLM call)
 - Classifies: is this email announcing a real-life event? (bool + confidence)
-- If yes, extracts structured fields: `title`, `description`, `when`, `where`,
+- If yes, extracts structured fields: `title`, `when`, `where`,
   `signup_type` (`none | form | reply`), `form_url` (if a Google Form link is
   present in the body).
 - Fully automatic — no user-in-the-loop here. (Collaboration happens at RSVP
   time, per product decision below.)
-- Low-confidence or failed extraction → event stored with `status: needs_review`
-  rather than silently dropped or guessed.
+- Result is always persisted as a `ProcessedEvent` linked to its `Event` via
+  `event_id` — including the non-event and low-confidence cases (`status:
+  declined` / `needs_review`) — rather than silently dropped or guessed.
 
 **RSVP Agent** (ADK agent with tools + persistent memory — the track centerpiece)
 - Triggered when the user clicks "Attend" on an event in the catalog.
@@ -82,8 +97,8 @@ Firestore ◀──────────────────────�
   submit-on-behalf-of-user endpoint.
 
 **Frontend (Next.js on Vercel)**
-- Catalog page: event cards from `GET /events`, filterable by status
-  (`new | needs_review | attending | declined`).
+- Catalog page: event cards from `GET /api/v1/processed-events`, filterable
+  by status (`new | needs_review | attending | declined`).
 - "Attend" action: if the RSVP agent has clarifying questions, opens a small
   Q&A panel; otherwise goes straight to confirmation.
 - Confirmation view: shows "added to calendar" state plus the prefilled-form
@@ -91,12 +106,30 @@ Firestore ◀──────────────────────�
 
 ## Data model (Firestore)
 
-- `events/{id}`: `subject`, `sender`, `receivedAt`, `title`, `description`,
-  `when`, `where`, `signup_type`, `form_url`, `status`, `calendarEventId`
-- `processed_message_ids/{gmailMessageId}`: dedupe guard, no other fields needed
+Built on the teammate's existing `FirestoreModel`/`FirestoreRepository[T]`
+foundation (`backend/app/models/`, `backend/app/db/`) rather than a flat
+`events/{id}` shape:
+
+- `events/{id}` (`Event` model, already built): `sender`, `sent_on`,
+  `email_subject`, `email_content` — the raw ingested email, written by the
+  Gmail webhook before triage runs.
+- `processed_events/{id}` (`ProcessedEvent` model, extended): `event_id`
+  (FK to `Event`), `summarized_text`, `is_event`, `confidence`, `title`,
+  `when`, `where`, `signup_type`, `form_url`, `status`
+  (`new | needs_review | attending | declined`), `calendar_event_id`. This
+  is the record the catalog lists and RSVP acts on — what the original spec
+  called `EventRecord`. New fields default such that the teammate's
+  existing `POST /api/v1/processed-events` calls (which only send
+  `event_id` + `summarized_text`) keep working unchanged.
+- `processed_message_ids/{gmailMessageId}`: dedupe guard, no other fields
+  needed — unrelated to `ProcessedEvent` despite the similar name; this is
+  purely a Pub/Sub-retry guard, not a domain model, and isn't a
+  `FirestoreRepository` citizen.
 - `user_profile` (single doc — single demo user, see scope decision below):
   accumulated known answers (name, email, dietary preference, etc.) the RSVP
-  agent has learned across events
+  agent has learned across events. Kept as plain functions rather than a
+  `FirestoreRepository[T]`, since that abstraction assumes a collection of
+  many documents with generated IDs, not one fixed-ID singleton doc.
 
 ## Scope decisions (from brainstorming Q&A)
 
@@ -136,7 +169,7 @@ here so they aren't re-litigated during implementation:
   responses (both a clear-event and a clear-non-event case, plus a malformed
   response → `needs_review` case).
 - FastAPI test-client test for webhook idempotency: same Pub/Sub push sent
-  twice → exactly one `events` doc created.
+  twice → exactly one `Event`/`ProcessedEvent` pair created.
 - One RSVP-agent test asserting it only asks about form fields absent from
   the profile, and that answered fields get persisted to `user_profile`.
 - No e2e/browser testing — explicitly out of scope for this timeline.
