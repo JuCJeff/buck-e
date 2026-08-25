@@ -22,6 +22,36 @@
 
 ---
 
+## Reconciliation note (read before Task 1)
+
+A teammate independently built a Firestore data layer on `main` while this
+plan was being written — `backend/app/models/` (a `FirestoreModel` base +
+`Event` + `ProcessedEvent`), `backend/app/db/` (a generic
+`FirestoreRepository[T]` with get/list/create/update/delete), Firestore
+client setup in `backend/app/core/firestore.py`, and
+`GET`/`POST /api/v1/events` + `/api/v1/processed-events` with sender-domain
+allowlist validation. Tasks below have been rewritten to build on that
+foundation instead of duplicating it:
+
+- **No `backend/app/models.py` gets created.** `EventStatus` and the new
+  `ProcessedEvent` fields live in the existing `backend/app/models/processed_event.py`.
+  `TriageResult` and `FieldResolution` are defined locally where they're
+  used (`agents/triage_agent.py`, `agents/rsvp_agent.py`) since they're
+  transient agent I/O, never persisted directly.
+- **No `backend/app/services/firestore_client.py` gets created.** Everything
+  reuses the existing `app.core.firestore.get_firestore_client`.
+- **The catalog and RSVP APIs operate on `ProcessedEvent`, not a flat
+  `EventRecord`.** Routes live under `/api/v1/processed-events/...`, not
+  `/api/v1/events/...` — `/events` stays the raw-email endpoint the
+  teammate built.
+- **All new `ProcessedEvent` fields default** so the teammate's existing
+  tests (which `POST` only `event_id` + `summarized_text`) keep passing
+  unmodified.
+- Task numbering is unchanged from the original plan; only task bodies
+  changed. Tasks 2, 4, 8, 9, 15, 16 are unaffected by this reconciliation.
+
+---
+
 ## Implementation note (read before Task 11)
 
 The spec describes the RSVP agent as having "tools + persistent memory." In this
@@ -37,71 +67,95 @@ when you reach Task 11, don't silently re-interpret the spec.
 
 ---
 
-### Task 1: Config & shared models
+### Task 1: Config additions & ProcessedEvent triage fields
+
+Builds on the existing `backend/app/models/processed_event.py` and
+`backend/app/core/config.py` — see the Reconciliation note above.
 
 **Files:**
 - Modify: `backend/app/core/config.py`
-- Create: `backend/app/models.py`
-- Test: `backend/tests/test_models.py`
+- Modify: `backend/app/models/processed_event.py`
+- Test: `backend/tests/test_processed_event_model.py`
 
 **Interfaces:**
-- Produces: `app.core.config.settings` (extended), `app.models.EventStatus`,
-  `app.models.TriageResult`, `app.models.EventRecord`, `app.models.FieldResolution`
+- Produces: `app.core.config.settings` (extended with Gemini/Pub-Sub/Calendar/OAuth
+  fields), `app.models.processed_event.EventStatus`, `ProcessedEvent` (extended)
 
-- [ ] **Step 1: Add pytest config so `uv run pytest` finds the suite**
+- [ ] **Step 1: Confirm pytest config exists**
 
-Append to `backend/pyproject.toml`:
-
-```toml
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-```
+Check `backend/pyproject.toml` for a `[tool.pytest.ini_options]` section with
+`testpaths = ["tests"]`. If missing, append it. (It may already be present —
+verify before adding, don't duplicate the section.)
 
 - [ ] **Step 2: Write the failing test**
 
-Create `backend/tests/test_models.py`:
+Create `backend/tests/test_processed_event_model.py`:
 
 ```python
-from app.models import EventStatus, TriageResult
+from app.models.processed_event import EventStatus, ProcessedEvent
+
+
+def test_processed_event_new_fields_default_for_backward_compatibility():
+    """The teammate's existing POST /processed-events/ only sends event_id
+    and summarized_text — every new field here must default so that keeps
+    working unmodified."""
+    processed = ProcessedEvent(event_id="e1", summarized_text="summary")
+
+    assert processed.is_event is True
+    assert processed.confidence == 1.0
+    assert processed.title == ""
+    assert processed.when == ""
+    assert processed.where == ""
+    assert processed.signup_type == "none"
+    assert processed.form_url is None
+    assert processed.status == EventStatus.NEW
+    assert processed.calendar_event_id is None
 
 
 def test_event_status_values():
     assert EventStatus.NEW == "new"
+    assert EventStatus.NEEDS_REVIEW == "needs_review"
     assert EventStatus.ATTENDING == "attending"
-
-
-def test_triage_result_defaults_to_no_signup():
-    result = TriageResult(is_event=True, confidence=0.9, title="Club Fair")
-    assert result.signup_type == "none"
-    assert result.form_url is None
+    assert EventStatus.DECLINED == "declined"
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `cd backend && uv run pytest tests/test_models.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'app.models'`
+Run: `cd backend && uv run pytest tests/test_processed_event_model.py -v`
+Expected: FAIL with `ImportError: cannot import name 'EventStatus'`
 
 - [ ] **Step 4: Extend config**
 
-In `backend/app/core/config.py`, add these fields inside `Settings` (after `debug`):
+In `backend/app/core/config.py`, add these fields inside `Settings` (after
+the existing `allowed_email_domains`/`allowed_email_domains_list` block —
+do not touch or rename any existing field):
 
 ```python
-    google_cloud_project: str = "buck-e-hackathon"
-    school_email_domain: str = "school.edu"
+    # Gemini / ADK
     gemini_model: str = "gemini-flash-latest"
+
+    # Gmail push ingestion
     gmail_pubsub_topic: str = ""
+
+    # Calendar
     calendar_id: str = "primary"
+
+    # Gmail/Calendar/Forms end-user OAuth (separate from the
+    # google_application_credentials service account above, which is
+    # Firestore-only)
     google_client_secrets_path: str = "credentials.json"
     google_token_path: str = "token.json"
 ```
 
-- [ ] **Step 5: Write `backend/app/models.py`**
+- [ ] **Step 5: Extend `backend/app/models/processed_event.py`**
+
+Replace the file's full contents with:
 
 ```python
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, Optional
 
-from pydantic import BaseModel
+from app.models.base import FirestoreModel
 
 SignupType = Literal["none", "form", "reply"]
 
@@ -113,50 +167,35 @@ class EventStatus(StrEnum):
     DECLINED = "declined"
 
 
-class TriageResult(BaseModel):
-    is_event: bool
-    confidence: float
+class ProcessedEvent(FirestoreModel):
+    event_id: str
+    summarized_text: str
+    is_event: bool = True
+    confidence: float = 1.0
     title: str = ""
-    description: str = ""
     when: str = ""
     where: str = ""
     signup_type: SignupType = "none"
-    form_url: str | None = None
-
-
-class EventRecord(BaseModel):
-    id: str
-    subject: str
-    sender: str
-    received_at: str
-    title: str
-    description: str
-    when: str
-    where: str
-    signup_type: SignupType
-    form_url: str | None = None
+    form_url: Optional[str] = None
     status: EventStatus = EventStatus.NEW
-    calendar_event_id: str | None = None
-
-
-class FieldResolution(BaseModel):
-    field_id: str
-    label: str
-    resolved: bool
-    value: str | None = None
-    question: str | None = None
+    calendar_event_id: Optional[str] = None
 ```
 
-- [ ] **Step 6: Run test to verify it passes**
+- [ ] **Step 6: Run the new test, then the full suite, to verify nothing broke**
 
-Run: `cd backend && uv run pytest tests/test_models.py -v`
+Run: `cd backend && uv run pytest tests/test_processed_event_model.py -v`
 Expected: PASS
+
+Run: `cd backend && uv run pytest -v`
+Expected: all PASS, including the teammate's existing `test_events.py` and
+`test_processed_events.py` unmodified — this is the backward-compatibility
+check for Step 5's new defaults.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add backend/pyproject.toml backend/app/core/config.py backend/app/models.py backend/tests/test_models.py
-git commit -m "feat: add event/triage models and extended settings
+git add backend/pyproject.toml backend/app/core/config.py backend/app/models/processed_event.py backend/tests/test_processed_event_model.py
+git commit -m "feat: add triage fields to ProcessedEvent and extend settings
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -274,26 +313,24 @@ to produce the first `token.json` before the webhook/agent tasks can hit live AP
 
 ---
 
-### Task 3: Firestore client + dedupe service
+### Task 3: Dedupe service
+
+Reuses the existing `app.core.firestore.get_firestore_client` (already
+added by the teammate's Firestore work — `google-cloud-firestore` is
+already a dependency, no need to re-add it) rather than creating a
+duplicate Firestore client.
 
 **Files:**
-- Create: `backend/app/services/firestore_client.py`
 - Create: `backend/app/services/dedupe.py`
 - Test: `backend/tests/test_dedupe.py`
 
 **Interfaces:**
-- Produces: `app.services.firestore_client.get_firestore_client() -> google.cloud.firestore.Client`,
-  `app.services.dedupe.is_processed(db, message_id: str) -> bool`,
+- Consumes: `app.core.firestore.get_firestore_client`
+- Produces: `app.services.dedupe.is_processed(db, message_id: str) -> bool`,
   `app.services.dedupe.mark_processed(db, message_id: str) -> None`
-  — both dedupe functions take `db` as an explicit param so tests can pass a fake.
+  — both take `db` as an explicit param so tests can pass a fake.
 
-- [ ] **Step 1: Add the Firestore dependency**
-
-```bash
-cd backend && uv add google-cloud-firestore
-```
-
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 1: Write the failing test**
 
 Create `backend/tests/test_dedupe.py`:
 
@@ -351,27 +388,12 @@ def test_dedupe_marks_and_detects_processed_messages():
     assert is_processed(db, "msg-2") is False
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+- [ ] **Step 2: Run test to verify it fails**
 
 Run: `cd backend && uv run pytest tests/test_dedupe.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'app.services'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'app.services.dedupe'`
 
-- [ ] **Step 4: Write `backend/app/services/firestore_client.py`**
-
-```python
-from functools import lru_cache
-
-from google.cloud import firestore
-
-from app.core.config import settings
-
-
-@lru_cache
-def get_firestore_client() -> firestore.Client:
-    return firestore.Client(project=settings.google_cloud_project)
-```
-
-- [ ] **Step 5: Write `backend/app/services/dedupe.py`**
+- [ ] **Step 3: Write `backend/app/services/dedupe.py`**
 
 ```python
 PROCESSED_COLLECTION = "processed_message_ids"
@@ -388,16 +410,16 @@ def mark_processed(db, message_id: str) -> None:
     )
 ```
 
-- [ ] **Step 6: Run test to verify it passes**
+- [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd backend && uv run pytest tests/test_dedupe.py -v`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add backend/pyproject.toml backend/uv.lock backend/app/services/firestore_client.py backend/app/services/dedupe.py backend/tests/test_dedupe.py
-git commit -m "feat: add firestore client and message dedupe guard
+git add backend/app/services/dedupe.py backend/tests/test_dedupe.py
+git commit -m "feat: add gmail message dedupe guard
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -547,14 +569,22 @@ email that requires it (YAGNI).
 
 ### Task 5: Triage/summarizer agent (ADK)
 
+`TriageResult` is defined locally in this task's file — it's transient agent
+output, never persisted directly (Task 6 maps its fields onto the existing
+`ProcessedEvent` model instead). Do not create `app/models.py`.
+
 **Files:**
 - Create: `backend/app/agents/runner.py`
 - Create: `backend/app/agents/triage_agent.py`
 - Test: `backend/tests/test_triage_agent.py`
 
 **Interfaces:**
-- Consumes: `app.models.TriageResult`, `app.core.config.settings.gemini_model`
+- Consumes: `app.core.config.settings.gemini_model`
 - Produces: `app.agents.runner.run_structured_agent(agent, output_schema, user_id, message_text) -> BaseModel`,
+  `app.agents.triage_agent.TriageResult` (fields: `is_event: bool`,
+  `confidence: float`, `title: str`, `description: str`, `when: str`,
+  `where: str`, `signup_type: Literal["none","form","reply"]`,
+  `form_url: str | None`),
   `app.agents.triage_agent.build_triage_agent() -> Agent`,
   `app.agents.triage_agent.run_triage(subject: str, sender: str, body_text: str) -> TriageResult`
 
@@ -571,8 +601,7 @@ Create `backend/tests/test_triage_agent.py`:
 ```python
 from unittest.mock import patch
 
-from app.agents.triage_agent import run_triage
-from app.models import TriageResult
+from app.agents.triage_agent import TriageResult, run_triage
 
 
 def test_run_triage_returns_parsed_result():
@@ -643,11 +672,25 @@ def run_structured_agent(
 - [ ] **Step 5: Write `backend/app/agents/triage_agent.py`**
 
 ```python
+from typing import Literal
+
 from google.adk.agents import LlmAgent
+from pydantic import BaseModel
 
 from app.agents.runner import run_structured_agent
 from app.core.config import settings
-from app.models import TriageResult
+
+
+class TriageResult(BaseModel):
+    is_event: bool
+    confidence: float
+    title: str = ""
+    description: str = ""
+    when: str = ""
+    where: str = ""
+    signup_type: Literal["none", "form", "reply"] = "none"
+    form_url: str | None = None
+
 
 TRIAGE_INSTRUCTION = """You triage school emails. Given a subject, sender, and
 body, decide whether this email is announcing a real-life event (an info
@@ -713,6 +756,12 @@ calling code, not ADK's actual response shape.
 
 ### Task 6: Gmail webhook (ingestion end-to-end)
 
+Uses the existing `FirestoreRepository[Event]`/`FirestoreRepository[ProcessedEvent]`
+(via FastAPI `Depends`, same pattern as `app/api/v1/events.py`) instead of
+raw Firestore writes. The dedupe guard (Task 3) is the one piece that still
+takes a raw `firestore.Client`, since `processed_message_ids` isn't a domain
+model.
+
 **Files:**
 - Create: `backend/app/services/events_store.py`
 - Create: `backend/app/api/v1/webhooks.py`
@@ -720,47 +769,66 @@ calling code, not ADK's actual response shape.
 - Test: `backend/tests/test_webhook_gmail.py`
 
 **Interfaces:**
-- Consumes: `dedupe.is_processed/mark_processed`, `gmail_service.list_new_message_ids/get_message_content`,
-  `triage_agent.run_triage`, `firestore_client.get_firestore_client`
-- Produces: `app.services.events_store.save_event(db, event: EventRecord) -> None`,
+- Consumes: `dedupe.is_processed/mark_processed`,
+  `gmail_service.list_new_message_ids/get_message_content`,
+  `triage_agent.run_triage`, `app.core.firestore.get_firestore_client`,
+  `app.db.collections.get_event_repository/get_processed_event_repository`
+- Produces:
+  `app.services.events_store.ingest_triaged_email(event_repo, processed_event_repo, *, sender, sent_on, subject, body_text, triage) -> ProcessedEvent`,
   `POST /api/v1/webhooks/gmail`
 
 - [ ] **Step 1: Write `backend/app/services/events_store.py`**
 
 ```python
-import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 
-from app.models import EventRecord, EventStatus, TriageResult
+from app.agents.triage_agent import TriageResult
+from app.db.repository import FirestoreRepository
+from app.models.event import Event
+from app.models.processed_event import EventStatus, ProcessedEvent
 
-EVENTS_COLLECTION = "events"
 
+def ingest_triaged_email(
+    event_repo: FirestoreRepository[Event],
+    processed_event_repo: FirestoreRepository[ProcessedEvent],
+    *,
+    sender: str,
+    sent_on: datetime,
+    subject: str,
+    body_text: str,
+    triage: TriageResult,
+) -> ProcessedEvent:
+    event = event_repo.create(
+        Event(sender=sender, sent_on=sent_on, email_subject=subject, email_content=body_text)
+    )
 
-def save_event(db, *, subject: str, sender: str, triage: TriageResult) -> EventRecord:
     status = EventStatus.NEW if triage.is_event else EventStatus.DECLINED
     if triage.is_event and triage.confidence < 0.5:
         status = EventStatus.NEEDS_REVIEW
 
-    record = EventRecord(
-        id=str(uuid.uuid4()),
-        subject=subject,
-        sender=sender,
-        received_at=datetime.now(UTC).isoformat(),
-        title=triage.title,
-        description=triage.description,
-        when=triage.when,
-        where=triage.where,
-        signup_type=triage.signup_type,
-        form_url=triage.form_url,
-        status=status,
+    return processed_event_repo.create(
+        ProcessedEvent(
+            event_id=event.id,
+            summarized_text=triage.description or "(no summary)",
+            is_event=triage.is_event,
+            confidence=triage.confidence,
+            title=triage.title,
+            when=triage.when,
+            where=triage.where,
+            signup_type=triage.signup_type,
+            form_url=triage.form_url,
+            status=status,
+        )
     )
-    db.collection(EVENTS_COLLECTION).document(record.id).set(record.model_dump())
-    return record
 ```
 
 - [ ] **Step 2: Write the failing test**
 
-Create `backend/tests/test_webhook_gmail.py`:
+Create `backend/tests/test_webhook_gmail.py`. The `FakeEventRepository`/
+`FakeProcessedEventRepository` classes below intentionally mirror the ones
+already in `test_events.py`/`test_processed_events.py` rather than
+centralizing them — that duplication is the existing convention in this
+test suite, follow it rather than refactoring it as part of this task.
 
 ```python
 import base64
@@ -769,10 +837,48 @@ from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
+from app.agents.triage_agent import TriageResult
+from app.core.config import settings
+from app.core.firestore import get_firestore_client
+from app.db.collections import get_event_repository, get_processed_event_repository
 from app.main import app
-from app.models import TriageResult
+from app.models.event import Event
+from app.models.processed_event import ProcessedEvent
+from tests.fakes import FakeFirestore
 
 client = TestClient(app)
+
+
+class FakeEventRepository:
+    def __init__(self) -> None:
+        self._items: dict[str, Event] = {}
+
+    def get(self, doc_id):
+        return self._items.get(doc_id)
+
+    def list(self, limit: int = 50):
+        return list(self._items.values())[:limit]
+
+    def create(self, item: Event) -> Event:
+        item.id = str(len(self._items) + 1)
+        self._items[item.id] = item
+        return item
+
+
+class FakeProcessedEventRepository:
+    def __init__(self) -> None:
+        self._items: dict[str, ProcessedEvent] = {}
+
+    def get(self, doc_id):
+        return self._items.get(doc_id)
+
+    def list(self, limit: int = 50):
+        return list(self._items.values())[:limit]
+
+    def create(self, item: ProcessedEvent) -> ProcessedEvent:
+        item.id = str(len(self._items) + 1)
+        self._items[item.id] = item
+        return item
 
 
 def _push_body(history_id: str) -> dict:
@@ -781,19 +887,23 @@ def _push_body(history_id: str) -> dict:
     return {"message": {"data": encoded, "messageId": "pubsub-1"}, "subscription": "sub"}
 
 
-@patch("app.api.v1.webhooks.get_firestore_client")
 @patch("app.api.v1.webhooks.run_triage")
 @patch("app.api.v1.webhooks.get_message_content")
 @patch("app.api.v1.webhooks.list_new_message_ids", return_value=["m1"])
 @patch("app.api.v1.webhooks.build_gmail_service", return_value=MagicMock())
 @patch("app.api.v1.webhooks.get_credentials", return_value=MagicMock())
 def test_duplicate_push_only_creates_one_event(
-    _creds, _service, _list_ids, get_content, run_triage_mock, get_db
+    _creds, _service, _list_ids, get_content, run_triage_mock, monkeypatch
 ):
-    from tests.fakes import FakeFirestore
+    monkeypatch.setattr(settings, "allowed_email_domains", "school.edu")
 
     fake_db = FakeFirestore()
-    get_db.return_value = fake_db
+    fake_event_repo = FakeEventRepository()
+    fake_processed_repo = FakeProcessedEventRepository()
+    app.dependency_overrides[get_firestore_client] = lambda: fake_db
+    app.dependency_overrides[get_event_repository] = lambda: fake_event_repo
+    app.dependency_overrides[get_processed_event_repository] = lambda: fake_processed_repo
+
     get_content.return_value = {
         "message_id": "m1",
         "subject": "Club Fair!",
@@ -802,13 +912,19 @@ def test_duplicate_push_only_creates_one_event(
     }
     run_triage_mock.return_value = TriageResult(is_event=True, confidence=0.9, title="Club Fair")
 
-    body = _push_body("100")
-    r1 = client.post("/api/v1/webhooks/gmail", json=body)
-    r2 = client.post("/api/v1/webhooks/gmail", json=body)
+    try:
+        body = _push_body("100")
+        r1 = client.post("/api/v1/webhooks/gmail", json=body)
+        r2 = client.post("/api/v1/webhooks/gmail", json=body)
 
-    assert r1.status_code == 204
-    assert r2.status_code == 204
-    assert len(fake_db._collections.get("events", {})) == 1
+        assert r1.status_code == 204
+        assert r2.status_code == 204
+        assert len(fake_event_repo.list()) == 1
+        assert len(fake_processed_repo.list()) == 1
+    finally:
+        app.dependency_overrides.pop(get_firestore_client, None)
+        app.dependency_overrides.pop(get_event_repository, None)
+        app.dependency_overrides.pop(get_processed_event_repository, None)
 ```
 
 - [ ] **Step 3: Create the shared test fake**
@@ -878,15 +994,21 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'app.api.v1.webhooks'`
 ```python
 import base64
 import json
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Depends, Response
+from google.cloud import firestore
 
 from app.agents.triage_agent import run_triage
 from app.core.config import settings
+from app.core.firestore import get_firestore_client
 from app.core.google_auth import get_credentials
+from app.db.collections import get_event_repository, get_processed_event_repository
+from app.db.repository import FirestoreRepository
+from app.models.event import Event
+from app.models.processed_event import ProcessedEvent
 from app.services.dedupe import is_processed, mark_processed
-from app.services.events_store import save_event
-from app.services.firestore_client import get_firestore_client
+from app.services.events_store import ingest_triaged_email
 from app.services.gmail_service import (
     build_gmail_service,
     get_message_content,
@@ -898,14 +1020,27 @@ router = APIRouter()
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 
+def _sender_domain_allowed(sender: str) -> bool:
+    sender_lower = sender.lower()
+    return any(
+        sender_lower.endswith(f"@{domain}") for domain in settings.allowed_email_domains_list
+    )
+
+
 @router.post("/webhooks/gmail", status_code=204)
-def handle_gmail_push(payload: dict) -> Response:
+def handle_gmail_push(
+    payload: dict,
+    db: firestore.Client = Depends(get_firestore_client),
+    event_repo: FirestoreRepository[Event] = Depends(get_event_repository),
+    processed_event_repo: FirestoreRepository[ProcessedEvent] = Depends(
+        get_processed_event_repository
+    ),
+) -> Response:
     data = json.loads(base64.urlsafe_b64decode(payload["message"]["data"]))
     history_id = data["historyId"]
 
     creds = get_credentials(GMAIL_SCOPES)
     service = build_gmail_service(creds)
-    db = get_firestore_client()
 
     message_ids = list_new_message_ids(service, start_history_id=history_id)
     for message_id in message_ids:
@@ -913,7 +1048,7 @@ def handle_gmail_push(payload: dict) -> Response:
             continue
 
         message = get_message_content(service, message_id)
-        if not message["sender"].endswith(f"@{settings.school_email_domain}"):
+        if not _sender_domain_allowed(message["sender"]):
             mark_processed(db, message_id)
             continue
 
@@ -922,7 +1057,18 @@ def handle_gmail_push(payload: dict) -> Response:
             sender=message["sender"],
             body_text=message["body_text"],
         )
-        save_event(db, subject=message["subject"], sender=message["sender"], triage=triage)
+        ingest_triaged_email(
+            event_repo,
+            processed_event_repo,
+            sender=message["sender"],
+            # Arrival time stands in for the email's real Date header — good
+            # enough for the MVP; add real header parsing if precise send
+            # times matter later (YAGNI).
+            sent_on=datetime.now(UTC),
+            subject=message["subject"],
+            body_text=message["body_text"],
+            triage=triage,
+        )
         mark_processed(db, message_id)
 
     return Response(status_code=204)
@@ -954,105 +1100,39 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 7: Catalog API
+### Task 7: Catalog API — already built, verify only
 
-**Files:**
-- Create: `backend/app/api/v1/events.py`
-- Modify: `backend/app/api/v1/router.py`
-- Test: `backend/tests/test_events_api.py`
+The teammate's `GET`/`POST /api/v1/processed-events` (and `/events`) already
+exist and are already tested (`backend/tests/test_processed_events.py`).
+Task 1 extended `ProcessedEvent` with `title`/`when`/`where`/`status`/etc.,
+and those fields flow through the existing `list`/`get` handlers automatically
+(they just serialize the model) — no new endpoint code is needed. This task
+is a verification pass, not a build.
 
-**Interfaces:**
-- Produces: `GET /api/v1/events`, `GET /api/v1/events/{event_id}`
+**Files:** none created or modified.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Confirm the extended fields serialize correctly**
 
-Create `backend/tests/test_events_api.py`:
+Run: `cd backend && uv run pytest tests/test_processed_events.py -v`
+Expected: PASS (unchanged — confirms Task 1's new `ProcessedEvent` fields
+didn't break the existing endpoint tests).
 
-```python
-from unittest.mock import patch
-
-from fastapi.testclient import TestClient
-
-from app.main import app
-from tests.fakes import FakeFirestore
-
-client = TestClient(app)
-
-
-@patch("app.api.v1.events.get_firestore_client")
-def test_list_and_get_event(get_db):
-    db = FakeFirestore()
-    db.collection("events").document("e1").set(
-        {"id": "e1", "title": "Club Fair", "status": "new"}
-    )
-    get_db.return_value = db
-
-    list_response = client.get("/api/v1/events")
-    assert list_response.status_code == 200
-    assert list_response.json() == [{"id": "e1", "title": "Club Fair", "status": "new"}]
-
-    get_response = client.get("/api/v1/events/e1")
-    assert get_response.status_code == 200
-    assert get_response.json()["id"] == "e1"
-
-    missing_response = client.get("/api/v1/events/does-not-exist")
-    assert missing_response.status_code == 404
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cd backend && uv run pytest tests/test_events_api.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'app.api.v1.events'`
-
-- [ ] **Step 3: Write `backend/app/api/v1/events.py`**
-
-```python
-from fastapi import APIRouter, HTTPException
-
-from app.services.events_store import EVENTS_COLLECTION
-from app.services.firestore_client import get_firestore_client
-
-router = APIRouter()
-
-
-@router.get("/events")
-def list_events() -> list[dict]:
-    db = get_firestore_client()
-    return [doc.to_dict() for doc in db.collection(EVENTS_COLLECTION).stream()]
-
-
-@router.get("/events/{event_id}")
-def get_event(event_id: str) -> dict:
-    db = get_firestore_client()
-    doc = db.collection(EVENTS_COLLECTION).document(event_id).get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return doc.to_dict()
-```
-
-- [ ] **Step 4: Mount the router**
-
-In `backend/app/api/v1/router.py`, add:
-
-```python
-from app.api.v1.events import router as events_router
-
-router.include_router(events_router)
-```
-
-- [ ] **Step 5: Run test to verify it passes**
-
-Run: `cd backend && uv run pytest tests/test_events_api.py -v`
-Expected: PASS
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 2: Manually confirm the response shape includes the new fields**
 
 ```bash
-git add backend/app/api/v1/events.py backend/app/api/v1/router.py backend/tests/test_events_api.py
-git commit -m "feat: add event catalog API
-
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+cd backend && uv run python -c "
+from app.models.processed_event import ProcessedEvent
+p = ProcessedEvent(event_id='e1', summarized_text='s', title='Club Fair', status='new')
+print(p.model_dump())
+"
 ```
+
+Expected: the printed dict includes `title`, `when`, `where`, `signup_type`,
+`form_url`, `status`, `calendar_event_id` alongside the original
+`event_id`/`summarized_text` — confirming `GET /api/v1/processed-events`
+already returns everything the catalog page (Task 14) needs.
+
+No commit — nothing changed in this task.
 
 ---
 
@@ -1273,11 +1353,18 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ### Task 10: User profile store
 
+Kept as plain functions taking `db` explicitly (not a `FirestoreRepository[T]`)
+— that abstraction assumes a collection of many documents with generated
+IDs, and this is one fixed-ID singleton doc. Depends on `tests/fakes.py`
+(from Task 6) for its test, not on any Task 3 file.
+
 **Files:**
 - Create: `backend/app/services/profile_service.py`
 - Test: `backend/tests/test_profile_service.py`
 
 **Interfaces:**
+- Consumes: `app.core.firestore.get_firestore_client` (the real caller in
+  Task 13 passes its result as `db`; this task's test passes a `FakeFirestore`)
 - Produces: `app.services.profile_service.get_profile(db) -> dict[str, str]`,
   `app.services.profile_service.save_profile_fields(db, answers: dict[str, str]) -> None`
 
@@ -1355,8 +1442,11 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 - Test: `backend/tests/test_rsvp_agent.py`
 
 **Interfaces:**
-- Consumes: `app.agents.runner.run_structured_agent`, `app.models.FieldResolution`
-- Produces: `app.agents.rsvp_agent.resolve_form_fields(form_fields: list[dict], known_profile: dict[str, str]) -> list[FieldResolution]`
+- Consumes: `app.agents.runner.run_structured_agent`
+- Produces: `app.agents.rsvp_agent.FieldResolution` (fields: `field_id: str`,
+  `label: str`, `resolved: bool`, `value: str | None`, `question: str | None`
+  — defined locally here, not in a shared `app/models.py`),
+  `app.agents.rsvp_agent.resolve_form_fields(form_fields: list[dict], known_profile: dict[str, str]) -> list[FieldResolution]`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1365,8 +1455,7 @@ Create `backend/tests/test_rsvp_agent.py`:
 ```python
 from unittest.mock import patch
 
-from app.agents.rsvp_agent import resolve_form_fields
-from app.models import FieldResolution
+from app.agents.rsvp_agent import FieldResolution, resolve_form_fields
 
 
 def test_resolve_form_fields_only_asks_for_missing_ones():
@@ -1410,7 +1499,15 @@ from pydantic import BaseModel, RootModel
 
 from app.agents.runner import run_structured_agent
 from app.core.config import settings
-from app.models import FieldResolution
+
+
+class FieldResolution(BaseModel):
+    field_id: str
+    label: str
+    resolved: bool
+    value: str | None = None
+    question: str | None = None
+
 
 RSVP_INSTRUCTION = """You match a Google Form's questions against a known
 user profile. For each form field, decide whether the profile already
@@ -1468,42 +1565,70 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ### Task 12: RSVP orchestration service
 
+Operates on `ProcessedEvent` through `FirestoreRepository[ProcessedEvent]`
+(get/update) instead of raw `db.collection()` calls. Still takes the raw
+`db` client separately for `profile_service` (Task 10, not a repository
+citizen — see its note).
+
 **Files:**
 - Create: `backend/app/services/rsvp_service.py`
 - Test: `backend/tests/test_rsvp_service.py`
 
 **Interfaces:**
 - Consumes: `profile_service.get_profile/save_profile_fields`, `forms_service.*`,
-  `calendar_service.create_event`, `rsvp_agent.resolve_form_fields`, `events_store.EVENTS_COLLECTION`
-- Produces: `app.services.rsvp_service.attend_event(db, creds, event_id: str) -> dict`,
-  `app.services.rsvp_service.answer_rsvp(db, creds, event_id: str, answers: dict[str, str]) -> dict`
-  (both return `{"done": bool, "questions": list[dict], "calendar_event_id": str | None, "form_link": str | None}`)
+  `calendar_service.create_event`, `rsvp_agent.resolve_form_fields`,
+  `app.db.repository.FirestoreRepository`, `app.models.processed_event.ProcessedEvent`
+- Produces:
+  `app.services.rsvp_service.attend_event(repo, db, creds, processed_event_id: str) -> dict`,
+  `app.services.rsvp_service.answer_rsvp(repo, db, creds, processed_event_id: str, answers: dict[str, str]) -> dict`
+  (`repo` is a `FirestoreRepository[ProcessedEvent]`; both return
+  `{"done": bool, "questions": list[dict], "calendar_event_id": str | None, "form_link": str | None}`)
 
 - [ ] **Step 1: Write the failing test**
 
-Create `backend/tests/test_rsvp_service.py`:
+Create `backend/tests/test_rsvp_service.py`. `FakeProcessedEventRepository`
+here adds an `update` method the teammate's own fakes don't need yet —
+that's expected, this task is the first consumer of `update`.
 
 ```python
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
-from app.models import FieldResolution
+from app.agents.rsvp_agent import FieldResolution
+from app.models.processed_event import ProcessedEvent
 from app.services.rsvp_service import answer_rsvp, attend_event
-from tests.fakes import FakeFirestore
 
 
-def _event(db, **overrides):
-    event = {
-        "id": "e1",
-        "title": "Club Fair",
-        "description": "Fun fair",
-        "when": "2026-09-02",
-        "signup_type": "form",
-        "form_url": "https://docs.google.com/forms/d/1AbCdEf/viewform",
-        "status": "new",
+class FakeProcessedEventRepository:
+    def __init__(self) -> None:
+        self._items: dict[str, ProcessedEvent] = {}
+
+    def get(self, doc_id: str) -> Optional[ProcessedEvent]:
+        return self._items.get(doc_id)
+
+    def create(self, item: ProcessedEvent) -> ProcessedEvent:
+        item.id = str(len(self._items) + 1)
+        self._items[item.id] = item
+        return item
+
+    def update(self, doc_id: str, item: ProcessedEvent) -> ProcessedEvent:
+        item.id = doc_id
+        self._items[doc_id] = item
+        return item
+
+
+def _seed(repo, **overrides) -> ProcessedEvent:
+    processed = ProcessedEvent(
+        event_id="raw-e1",
+        summarized_text="Fun fair",
+        title="Club Fair",
+        when="2026-09-02",
+        signup_type="form",
+        form_url="https://docs.google.com/forms/d/1AbCdEf/viewform",
+        status="new",
         **overrides,
-    }
-    db.collection("events").document("e1").set(event)
-    return event
+    )
+    return repo.create(processed)
 
 
 @patch("app.services.rsvp_service.create_event", return_value="cal-1")
@@ -1515,14 +1640,14 @@ def _event(db, **overrides):
 def test_attend_asks_only_for_missing_fields(
     resolve_mock, _forms_svc, get_fields, _prefill, _cal_svc, _create_event
 ):
-    db = FakeFirestore()
-    _event(db)
+    repo = FakeProcessedEventRepository()
+    processed = _seed(repo)
     get_fields.return_value = [{"id": "q1", "label": "Full name", "required": True}]
     resolve_mock.return_value = [
         FieldResolution(field_id="q1", label="Full name", resolved=False, question="What's your name?")
     ]
 
-    result = attend_event(db, creds=MagicMock(), event_id="e1")
+    result = attend_event(repo, db=MagicMock(), creds=MagicMock(), processed_event_id=processed.id)
 
     assert result["done"] is False
     assert result["questions"] == [{"field_id": "q1", "label": "Full name", "question": "What's your name?"}]
@@ -1537,30 +1662,36 @@ def test_attend_asks_only_for_missing_fields(
 def test_answer_rsvp_finalizes_once_all_fields_resolved(
     resolve_mock, _forms_svc, get_fields, _prefill, _cal_svc, _create_event
 ):
-    db = FakeFirestore()
-    _event(db)
+    repo = FakeProcessedEventRepository()
+    processed = _seed(repo)
     get_fields.return_value = [{"id": "q1", "label": "Full name", "required": True}]
     resolve_mock.return_value = [
         FieldResolution(field_id="q1", label="Full name", resolved=True, value="Ada Lovelace")
     ]
 
-    result = answer_rsvp(db, creds=MagicMock(), event_id="e1", answers={"q1": "Ada Lovelace"})
+    result = answer_rsvp(
+        repo,
+        db=MagicMock(),
+        creds=MagicMock(),
+        processed_event_id=processed.id,
+        answers={"q1": "Ada Lovelace"},
+    )
 
     assert result["done"] is True
     assert result["calendar_event_id"] == "cal-1"
     assert result["form_link"] == "https://forms/prefilled"
-    updated = db.collection("events").document("e1").get().to_dict()
-    assert updated["status"] == "attending"
-    assert updated["calendar_event_id"] == "cal-1"
+    updated = repo.get(processed.id)
+    assert updated.status == "attending"
+    assert updated.calendar_event_id == "cal-1"
 
 
 def test_attend_skips_form_step_when_event_has_no_signup():
-    db = FakeFirestore()
-    _event(db, signup_type="none", form_url=None)
+    repo = FakeProcessedEventRepository()
+    processed = _seed(repo, signup_type="none", form_url=None)
 
     with patch("app.services.rsvp_service.build_calendar_service", return_value=MagicMock()), \
          patch("app.services.rsvp_service.create_event", return_value="cal-2"):
-        result = attend_event(db, creds=MagicMock(), event_id="e1")
+        result = attend_event(repo, db=MagicMock(), creds=MagicMock(), processed_event_id=processed.id)
 
     assert result == {
         "done": True,
@@ -1579,8 +1710,8 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'app.services.rsvp_ser
 
 ```python
 from app.agents.rsvp_agent import resolve_form_fields
+from app.models.processed_event import ProcessedEvent
 from app.services.calendar_service import build_calendar_service, create_event
-from app.services.events_store import EVENTS_COLLECTION
 from app.services.forms_service import (
     build_forms_service,
     build_prefill_link,
@@ -1590,17 +1721,17 @@ from app.services.forms_service import (
 from app.services.profile_service import get_profile, save_profile_fields
 
 
-def _finalize(db, creds, event: dict, form_link: str | None) -> dict:
+def _finalize(repo, creds, processed: ProcessedEvent, form_link: str | None) -> dict:
     calendar_service = build_calendar_service(creds)
     calendar_event_id = create_event(
         calendar_service,
-        title=event["title"],
-        description=event["description"],
-        when=event["when"],
+        title=processed.title,
+        description=processed.summarized_text,
+        when=processed.when,
     )
-    db.collection(EVENTS_COLLECTION).document(event["id"]).set(
-        {**event, "status": "attending", "calendar_event_id": calendar_event_id}
-    )
+    processed.status = "attending"
+    processed.calendar_event_id = calendar_event_id
+    repo.update(processed.id, processed)
     return {
         "done": True,
         "questions": [],
@@ -1609,15 +1740,15 @@ def _finalize(db, creds, event: dict, form_link: str | None) -> dict:
     }
 
 
-def _resolve_pending_questions(db, creds, event: dict) -> dict:
-    form_id = extract_form_id(event["form_url"])
+def _resolve_pending_questions(repo, db, creds, processed: ProcessedEvent) -> dict:
+    form_id = extract_form_id(processed.form_url)
     try:
         forms_service = build_forms_service(creds)
         form_fields = get_form_fields(forms_service, form_id)
     except Exception:
         # Spec error-handling rule: a Forms read failure falls back to
         # "no form" rather than blocking the RSVP — Calendar add still happens.
-        return _finalize(db, creds, event, form_link=None)
+        return _finalize(repo, creds, processed, form_link=None)
     profile = get_profile(db)
 
     resolutions = resolve_form_fields(form_fields, profile)
@@ -1634,21 +1765,21 @@ def _resolve_pending_questions(db, creds, event: dict) -> dict:
         }
 
     answers = {r.field_id: r.value for r in resolutions if r.value}
-    form_link = build_prefill_link(event["form_url"], form_id, answers)
-    return _finalize(db, creds, event, form_link)
+    form_link = build_prefill_link(processed.form_url, form_id, answers)
+    return _finalize(repo, creds, processed, form_link)
 
 
-def attend_event(db, creds, event_id: str) -> dict:
-    event = db.collection(EVENTS_COLLECTION).document(event_id).get().to_dict()
-    if event.get("signup_type") != "form" or not event.get("form_url"):
-        return _finalize(db, creds, event, form_link=None)
-    return _resolve_pending_questions(db, creds, event)
+def attend_event(repo, db, creds, processed_event_id: str) -> dict:
+    processed = repo.get(processed_event_id)
+    if processed.signup_type != "form" or not processed.form_url:
+        return _finalize(repo, creds, processed, form_link=None)
+    return _resolve_pending_questions(repo, db, creds, processed)
 
 
-def answer_rsvp(db, creds, event_id: str, answers: dict[str, str]) -> dict:
+def answer_rsvp(repo, db, creds, processed_event_id: str, answers: dict[str, str]) -> dict:
     save_profile_fields(db, answers)
-    event = db.collection(EVENTS_COLLECTION).document(event_id).get().to_dict()
-    return _resolve_pending_questions(db, creds, event)
+    processed = repo.get(processed_event_id)
+    return _resolve_pending_questions(repo, db, creds, processed)
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -1669,57 +1800,83 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ### Task 13: RSVP API endpoints
 
+Routes live under `/processed-events/...` — that's the model the catalog
+lists and the one `attend`/`rsvp-answer` act on, not the raw `/events/...`
+the teammate built for ingestion.
+
 **Files:**
 - Create: `backend/app/api/v1/rsvp.py`
 - Modify: `backend/app/api/v1/router.py`
 - Test: `backend/tests/test_rsvp_api.py`
 
 **Interfaces:**
-- Produces: `POST /api/v1/events/{event_id}/attend`, `POST /api/v1/events/{event_id}/rsvp-answer`
+- Produces: `POST /api/v1/processed-events/{processed_event_id}/attend`,
+  `POST /api/v1/processed-events/{processed_event_id}/rsvp-answer`
 
 - [ ] **Step 1: Write the failing test**
 
-Create `backend/tests/test_rsvp_api.py`:
+Create `backend/tests/test_rsvp_api.py`. `get_firestore_client` and
+`get_processed_event_repository` are injected via FastAPI `Depends()` in
+the route signature — the reference is bound at import time, so a plain
+`@patch` on the module attribute won't reach it; use
+`app.dependency_overrides` for those two, the same mechanism the
+teammate's own `test_events.py`/`test_processed_events.py` already use.
+`get_credentials` is a plain function call inside the route body, so
+`@patch` works fine for it.
 
 ```python
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
+from app.core.firestore import get_firestore_client
+from app.db.collections import get_processed_event_repository
 from app.main import app
 
 client = TestClient(app)
 
 
 @patch("app.api.v1.rsvp.get_credentials")
-@patch("app.api.v1.rsvp.get_firestore_client")
 @patch("app.api.v1.rsvp.attend_event")
-def test_attend_endpoint_returns_service_result(attend_mock, _db, _creds):
+def test_attend_endpoint_returns_service_result(attend_mock, _creds):
     attend_mock.return_value = {
         "done": False,
         "questions": [{"field_id": "q1", "label": "Full name", "question": "What's your name?"}],
         "calendar_event_id": None,
         "form_link": None,
     }
+    app.dependency_overrides[get_firestore_client] = lambda: MagicMock()
+    app.dependency_overrides[get_processed_event_repository] = lambda: MagicMock()
 
-    response = client.post("/api/v1/events/e1/attend")
+    try:
+        response = client.post("/api/v1/processed-events/pe1/attend")
+    finally:
+        app.dependency_overrides.pop(get_firestore_client, None)
+        app.dependency_overrides.pop(get_processed_event_repository, None)
 
     assert response.status_code == 200
     assert response.json()["done"] is False
 
 
 @patch("app.api.v1.rsvp.get_credentials")
-@patch("app.api.v1.rsvp.get_firestore_client")
 @patch("app.api.v1.rsvp.answer_rsvp")
-def test_rsvp_answer_endpoint_passes_through_answers(answer_mock, _db, _creds):
+def test_rsvp_answer_endpoint_passes_through_answers(answer_mock, _creds):
     answer_mock.return_value = {
         "done": True,
         "questions": [],
         "calendar_event_id": "cal-1",
         "form_link": "https://forms/prefilled",
     }
+    app.dependency_overrides[get_firestore_client] = lambda: MagicMock()
+    app.dependency_overrides[get_processed_event_repository] = lambda: MagicMock()
 
-    response = client.post("/api/v1/events/e1/rsvp-answer", json={"answers": {"q1": "Ada"}})
+    try:
+        response = client.post(
+            "/api/v1/processed-events/pe1/rsvp-answer", json={"answers": {"q1": "Ada"}}
+        )
+    finally:
+        app.dependency_overrides.pop(get_firestore_client, None)
+        app.dependency_overrides.pop(get_processed_event_repository, None)
 
     assert response.status_code == 200
     assert response.json()["done"] is True
@@ -1735,14 +1892,18 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'app.api.v1.rsvp'`
 - [ ] **Step 3: Write `backend/app/api/v1/rsvp.py`**
 
 ```python
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from google.cloud import firestore
 from pydantic import BaseModel
 
+from app.core.firestore import get_firestore_client
 from app.core.google_auth import get_credentials
-from app.services.firestore_client import get_firestore_client
+from app.db.collections import get_processed_event_repository
+from app.db.repository import FirestoreRepository
+from app.models.processed_event import ProcessedEvent
 from app.services.rsvp_service import answer_rsvp, attend_event
 
-router = APIRouter()
+router = APIRouter(prefix="/processed-events")
 
 RSVP_SCOPES = [
     "https://www.googleapis.com/auth/calendar",
@@ -1754,18 +1915,27 @@ class RsvpAnswerRequest(BaseModel):
     answers: dict[str, str]
 
 
-@router.post("/events/{event_id}/attend")
-def attend(event_id: str) -> dict:
-    db = get_firestore_client()
+@router.post("/{processed_event_id}/attend")
+def attend(
+    processed_event_id: str,
+    db: firestore.Client = Depends(get_firestore_client),
+    repo: FirestoreRepository[ProcessedEvent] = Depends(get_processed_event_repository),
+) -> dict:
     creds = get_credentials(RSVP_SCOPES)
-    return attend_event(db, creds=creds, event_id=event_id)
+    return attend_event(repo, db, creds=creds, processed_event_id=processed_event_id)
 
 
-@router.post("/events/{event_id}/rsvp-answer")
-def rsvp_answer(event_id: str, body: RsvpAnswerRequest) -> dict:
-    db = get_firestore_client()
+@router.post("/{processed_event_id}/rsvp-answer")
+def rsvp_answer(
+    processed_event_id: str,
+    body: RsvpAnswerRequest,
+    db: firestore.Client = Depends(get_firestore_client),
+    repo: FirestoreRepository[ProcessedEvent] = Depends(get_processed_event_repository),
+) -> dict:
     creds = get_credentials(RSVP_SCOPES)
-    return answer_rsvp(db, creds=creds, event_id=event_id, answers=body.answers)
+    return answer_rsvp(
+        repo, db, creds=creds, processed_event_id=processed_event_id, answers=body.answers
+    )
 ```
 
 - [ ] **Step 4: Mount the router**
@@ -1796,6 +1966,10 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ### Task 14: Frontend API client + catalog page
 
+`EventRecord` here mirrors the backend's `ProcessedEvent` (Task 1), not the
+raw `Event` — the catalog lists and acts on processed events. All API calls
+hit `/api/v1/processed-events/...`, not `/api/v1/events/...`.
+
 **Files:**
 - Create: `frontend/lib/api.ts`
 - Modify: `frontend/app/page.tsx`
@@ -1804,7 +1978,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `getEvents(): Promise<EventRecord[]>`, `getEvent(id): Promise<EventRecord>`,
   `attendEvent(id): Promise<RsvpResult>`, `answerRsvp(id, answers): Promise<RsvpResult>`
-  (types match the backend's `EventRecord`/`rsvp_service` response shapes above)
+  (types match the backend's `ProcessedEvent`/`rsvp_service` response shapes above)
 
 This task has no backend-style unit test — it's UI wiring against an API
 already covered by backend tests. Verify it by running the dev servers and
@@ -1826,11 +2000,11 @@ export type EventStatus = "new" | "needs_review" | "attending" | "declined";
 
 export interface EventRecord {
   id: string;
-  subject: string;
-  sender: string;
-  received_at: string;
+  event_id: string;
+  summarized_text: string;
+  is_event: boolean;
+  confidence: number;
   title: string;
-  description: string;
   when: string;
   where: string;
   signup_type: "none" | "form" | "reply";
@@ -1865,12 +2039,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export const getEvents = () => request<EventRecord[]>("/events");
-export const getEvent = (id: string) => request<EventRecord>(`/events/${id}`);
+export const getEvents = () => request<EventRecord[]>("/processed-events/");
+export const getEvent = (id: string) => request<EventRecord>(`/processed-events/${id}`);
 export const attendEvent = (id: string) =>
-  request<RsvpResult>(`/events/${id}/attend`, { method: "POST" });
+  request<RsvpResult>(`/processed-events/${id}/attend`, { method: "POST" });
 export const answerRsvp = (id: string, answers: Record<string, string>) =>
-  request<RsvpResult>(`/events/${id}/rsvp-answer`, {
+  request<RsvpResult>(`/processed-events/${id}/rsvp-answer`, {
     method: "POST",
     body: JSON.stringify({ answers }),
   });
@@ -1890,8 +2064,8 @@ interface EventCardProps {
 export function EventCard({ event, onAttend }: EventCardProps) {
   return (
     <div className="rounded-lg border p-4 flex flex-col gap-2">
-      <h3 className="font-semibold">{event.title || event.subject}</h3>
-      <p className="text-sm text-muted-foreground">{event.description}</p>
+      <h3 className="font-semibold">{event.title || event.summarized_text}</h3>
+      <p className="text-sm text-muted-foreground">{event.summarized_text}</p>
       <p className="text-sm">
         {event.when} {event.where && `· ${event.where}`}
       </p>
